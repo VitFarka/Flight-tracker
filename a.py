@@ -1,6 +1,11 @@
 import requests
 import pandas as pd
 import time
+import os
+import webbrowser
+import folium
+import http.server
+import threading
 CATEGORY_MAP = {
     "A0": "no category info",
     "A1": "light aircraft",
@@ -98,7 +103,73 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def main():
+def color_for_altitude(alt_baro, alt_numeric) -> str:
+    if alt_baro == "ground":
+        return "gray"
+    if pd.notna(alt_numeric) and alt_numeric < 20000:
+        return "orange"
+    return "blue"
+
+
+def plot_aircraft_map(df: pd.DataFrame, filename: str = "aircraft_map.html", refresh_seconds: int = 10) -> str:
+    """Plot each aircraft as a dot on a real map and save it as an HTML file."""
+    m = folium.Map(location=[LAT, LON], zoom_start=8, tiles="OpenStreetMap")
+
+    for _, row in df.iterrows():
+        if pd.isna(row["lat"]) or pd.isna(row["lon"]):
+            continue
+        label = row["flight"] if row["flight"] != "?" else row["hex"]
+        alt_text = "ground" if row["alt_baro"] == "ground" else (
+            f"{row['alt_baro']:.0f}ft" if pd.notna(row["alt_baro_numeric"]) else "unknown"
+        )
+        popup_text = (
+            f"<b>{label}</b><br>"
+            f"flight#: {row['flight_number']}<br>"
+            f"type: {row['t']} ({category_to_text(row['category'])})<br>"
+            f"reg: {row['r']}<br>"
+            f"alt: {alt_text}<br>"
+            f"gs: {row['gs']:.0f}kt<br>"
+            f"operator: {row['operator']}"
+        )
+        folium.CircleMarker(
+            location=[row["lat"], row["lon"]],
+            radius=6,
+            color=color_for_altitude(row["alt_baro"], row["alt_baro_numeric"]),
+            fill=True,
+            fill_opacity=0.85,
+            popup=folium.Popup(popup_text, max_width=250),
+            tooltip=label,
+        ).add_to(m)
+
+    # OSM's tile policy requires a Referer header - this ensures the browser sends one
+    m.get_root().html.add_child(folium.Element(
+        '<meta name="referrer" content="strict-origin-when-cross-origin">'
+    ))
+
+    # Auto-reload the already-open browser tab every refresh_seconds, so it stays live
+    m.get_root().html.add_child(folium.Element(
+        f'<meta http-equiv="refresh" content="{refresh_seconds}">'
+    ))
+
+    m.save(filename)
+    return os.path.abspath(filename)
+
+
+REFRESH_SECONDS = 15
+MAP_FILE = "aircraft_map.html"
+SERVER_PORT = 8765
+
+
+def start_local_server(port: int) -> None:
+    """Serve the current directory over http://localhost so the browser sends a Referer header."""
+    handler = http.server.SimpleHTTPRequestHandler
+    handler.log_message = lambda *args, **kwargs: None  # keep the console output clean
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+
+def run_once() -> pd.DataFrame:
     df = fetch_live_aircraft(LAT, LON, DIST_NM)
     print(f"{len(df)} aircraft within {DIST_NM}nm of Czechia")
 
@@ -108,12 +179,30 @@ def main():
         label = row["flight"] if row["flight"] != "?" else row["hex"]
         alt = "ground" if row["alt_baro"] == "ground" else f"{row['alt_baro']:.0f}ft" if pd.notna(row["alt_baro_numeric"]) else "?"
         print(
-            f"call: {label:10} | reg: {row['r']:8} | flight#: {row['flight_number']:6}| " 
+            f"call: {label:10} | reg: {row['r']:8} | flight#: {row['flight_number']:6}| "
             f"type: {row['t']:6} |  cat: {category_to_text(row['category']):22} | "
             f"lat: {row['lat']:.4f} lon: {row['lon']:.4f} | alt: {alt:>8} | "
             f"gs: {row['gs']:.0f}kt |"
             f"op: {row['operator']:22}"
         )
+
+    return df
+
+
+def main():
+    df = run_once()
+    map_path = plot_aircraft_map(df, filename=MAP_FILE, refresh_seconds=REFRESH_SECONDS)
+
+    start_local_server(SERVER_PORT)
+    webbrowser.open(f"http://127.0.0.1:{SERVER_PORT}/{MAP_FILE}")  # opens once; the page then auto-reloads itself
+
+    try:
+        while True:
+            time.sleep(REFRESH_SECONDS)
+            df = run_once()
+            plot_aircraft_map(df, filename=MAP_FILE, refresh_seconds=REFRESH_SECONDS)
+    except KeyboardInterrupt:
+        print("Stopped.")
 
 
 if __name__ == "__main__":
