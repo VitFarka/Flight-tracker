@@ -75,7 +75,7 @@ class Flight:
         # Filled in later by a FlightEnricher
         self.operator = "?"
         self.flight_number = "?"
-        self.route = "?"
+        self.route = ["?", None, None]
 
     @classmethod
     def from_api_record(cls, record: dict) -> "Flight":
@@ -122,6 +122,25 @@ class Flight:
         return self.lat is not None and self.lon is not None
 
     @property
+    def route_text(self) -> str:
+        return self.route[0]
+
+    @property
+    def origin_coords(self):
+        """(lat, lon) tuple for the origin airport, or None if unknown."""
+        return self.route[1]
+
+    @property
+    def destination_coords(self):
+        """(lat, lon) tuple for the destination airport, or None if unknown."""
+        return self.route[2]
+
+    @property
+    def has_route_coords(self) -> bool:
+        """True only when both origin and destination coordinates are known."""
+        return self.origin_coords is not None and self.destination_coords is not None
+
+    @property
     def direction_radians(self) -> Optional[float]:
         """Track over the ground as an angle in radians for ArrowIcon.
 
@@ -155,7 +174,7 @@ class Flight:
             f"reg: {self.registration}<br>"
             f"alt: {self.altitude_text}<br>"
             f"gs: {gs_text}<br>"
-            f"route: {self.route}<br>"
+            f"route: {self.route_text}<br>"
             f"operator: {self.operator}"
         )
 
@@ -167,7 +186,7 @@ class Flight:
             f"call: {self.label:10} | reg: {self.registration:8} | flight#: {self.flight_number:6}| "
             f"type: {self.aircraft_type:6} |  cat: {self.category_text:22} | "
             f"lat: {lat_text:>9} lon: {lon_text:>9} | alt: {self.altitude_text:>8} | "
-            f"gs: {gs_text:>7} | route: {self.route:10} |"
+            f"gs: {gs_text:>7} | route: {self.route_text:10} |"
             f"op: {self.operator:22}"
         )
 
@@ -221,9 +240,11 @@ class FlightEnricher:
         return "?"
 
     def _lookup_flightroute(self, callsign: str):
-        """Get the IATA flight number and origin-destination route for a callsign via adsbdb.com.
+        """Get the IATA flight number and route for a callsign via adsbdb.com.
 
-        Returns a (flight_number, route) tuple, e.g. ("BA455", "Malaga-Costa del Sol Airport (AGP) \u2192 London Heathrow Airport (LHR)").
+        Returns a (flight_number, route) tuple where route is
+        [route_text, origin_coords, destination_coords]. Always this
+        3-element list shape, even on failure - callers rely on it.
         """
         try:
             r = requests.get(f"https://api.adsbdb.com/v0/callsign/{callsign}", timeout=self.timeout)
@@ -234,10 +255,10 @@ class FlightEnricher:
                 return flight_number, route
         except requests.RequestException:
             pass
-        return "?", "?"
+        return "?", ["?", None, None]
 
     @staticmethod
-    def _format_route(origin: dict, destination: dict) -> str:
+    def _format_route(origin: dict, destination: dict) -> list:
         def airport_label(airport: dict) -> Optional[str]:
             name = airport.get("name")
             code = airport.get("iata_code") or airport.get("icao_code")
@@ -245,11 +266,18 @@ class FlightEnricher:
                 return f"{name} ({code})"
             return name or code
 
+        def airport_coords(airport: dict):
+            lat, lon = airport.get("latitude"), airport.get("longitude")
+            return (lat, lon) if lat is not None and lon is not None else None
+
         origin_label = airport_label(origin)
         destination_label = airport_label(destination)
         if not origin_label and not destination_label:
-            return "?"
-        return f"{origin_label or '?'} \u2192 {destination_label or '?'}"
+            text = "?"
+        else:
+            text = f"{origin_label or '?'} \u2192 {destination_label or '?'}"
+
+        return [text, airport_coords(origin), airport_coords(destination)]
 
 
 class FlightMap:
@@ -257,7 +285,8 @@ class FlightMap:
 
     Aircraft with a known track are drawn as arrows pointing in their
     direction of travel; aircraft with no known track (e.g. parked) fall
-    back to a plain colored dot.
+    back to a plain colored dot. When both the origin and destination
+    airport coordinates are known, a line is drawn between them.
     """
 
     def __init__(self, center_lat: float, center_lon: float, zoom_start: int = 8, arrow_length: int = 22):
@@ -277,6 +306,7 @@ class FlightMap:
             if not flight.has_position:
                 continue
             self._add_marker(m, flight)
+            #self._add_route_line(m, flight)
 
         # OSM's tile policy requires a Referer header - this ensures the browser sends one
         m.get_root().html.add_child(
@@ -317,6 +347,17 @@ class FlightMap:
                 popup=popup,
                 tooltip=flight.label,
             ).add_to(m)
+
+    def _add_route_line(self, m: folium.Map, flight: Flight) -> None:
+        """Draw a line between the origin and destination airports, if both are known."""
+        if not flight.has_route_coords:
+            return
+        folium.PolyLine(
+            locations=[flight.origin_coords,(flight.lat, flight.lon) ,flight.destination_coords],
+            color="#FF0000",
+            weight=2,
+            opacity=0.6,
+        ).add_to(m)
 
 
 class LocalMapServer:
