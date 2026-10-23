@@ -4,10 +4,12 @@ Live aircraft tracker.
 Fetches ADS-B data from adsb.lol, enriches it with registered-operator and
 IATA flight-number lookups, and renders the result on a self-refreshing
 Folium map served locally over HTTP (so OpenStreetMap sees a proper
-Referer header).
+Referer header). Each aircraft is drawn as an arrow pointing in its
+direction of travel (folium-arrow-icon: pip install folium-arrow-icon).
 """
 
 import http.server
+import math
 import os
 import threading
 import time
@@ -16,6 +18,7 @@ from typing import List, Optional
 
 import folium
 import requests
+from folium_arrow_icon import ArrowIcon
 
 
 class Flight:
@@ -56,6 +59,7 @@ class Flight:
         lon: Optional[float] = None,
         alt_baro=None,
         ground_speed: Optional[float] = None,
+        track: Optional[float] = None,
     ):
         self.hex = (hex_code or "?").lower()
         self.flight = (flight or "?").strip()
@@ -66,11 +70,12 @@ class Flight:
         self.lon = lon
         self.alt_baro = alt_baro  # "ground" (str) when parked/taxiing, else feet (number)
         self.ground_speed = ground_speed
+        self.track = track  # true track over the ground, degrees clockwise from north
 
         # Filled in later by a FlightEnricher
         self.operator = "?"
         self.flight_number = "?"
-        self.route = "?"
+        self.route = ["?", None, None]
 
     @classmethod
     def from_api_record(cls, record: dict) -> "Flight":
@@ -85,6 +90,7 @@ class Flight:
             lon=record.get("lon"),
             alt_baro=record.get("alt_baro"),
             ground_speed=record.get("gs"),
+            track=record.get("track"),
         )
 
     @property
@@ -116,14 +122,48 @@ class Flight:
         return self.lat is not None and self.lon is not None
 
     @property
+    def route_text(self) -> str:
+        return self.route[0]
+
+    @property
+    def origin_coords(self):
+        """(lat, lon) tuple for the origin airport, or None if unknown."""
+        return self.route[1]
+
+    @property
+    def destination_coords(self):
+        """(lat, lon) tuple for the destination airport, or None if unknown."""
+        return self.route[2]
+
+    @property
+    def has_route_coords(self) -> bool:
+        """True only when both origin and destination coordinates are known."""
+        return self.origin_coords is not None and self.destination_coords is not None
+
+    @property
+    def direction_radians(self) -> Optional[float]:
+        """Track over the ground as an angle in radians for ArrowIcon.
+
+        ArrowIcon's angle starts from the positive-latitude (north) axis and
+        goes clockwise, which is exactly how "track" is already defined, so
+        this is a plain degrees-to-radians conversion. Returns None when no
+        track is known (e.g. the aircraft is stationary on the ground).
+        """
+        if self.track is None:
+            return None
+        return math.radians(self.track)
+
+    @property
     def marker_color(self) -> str:
-        """Map-marker color: gray on the ground, orange below 20,000ft, blue above."""
-        if self.alt_baro == "ground":
-            return "gray"
-        alt = self.altitude_numeric
-        if alt is not None and alt < 20000:
-            return "orange"
-        return "blue"
+        """Marker color by aircraft category."""
+        if self.category == "A3":
+            return "blue"
+        if self.category == "A5":
+            return "red"
+        if self.category == "A2":
+            return "green"
+
+        return "gray"
 
     def popup_html(self) -> str:
         gs_text = f"{self.ground_speed:.0f}kt" if self.ground_speed is not None else "?"
@@ -134,7 +174,7 @@ class Flight:
             f"reg: {self.registration}<br>"
             f"alt: {self.altitude_text}<br>"
             f"gs: {gs_text}<br>"
-            f"route: {self.route}<br>"
+            f"route: {self.route_text}<br>"
             f"operator: {self.operator}"
         )
 
@@ -146,7 +186,7 @@ class Flight:
             f"call: {self.label:10} | reg: {self.registration:8} | flight#: {self.flight_number:6}| "
             f"type: {self.aircraft_type:6} |  cat: {self.category_text:22} | "
             f"lat: {lat_text:>9} lon: {lon_text:>9} | alt: {self.altitude_text:>8} | "
-            f"gs: {gs_text:>7} | route: {self.route:10} |"
+            f"gs: {gs_text:>7} | route: {self.route_text:10} |"
             f"op: {self.operator:22}"
         )
 
@@ -200,31 +240,60 @@ class FlightEnricher:
         return "?"
 
     def _lookup_flightroute(self, callsign: str):
-        """Get the IATA flight number and origin-destination route for a callsign via adsbdb.com.
+        """Get the IATA flight number and route for a callsign via adsbdb.com.
 
-        Returns a (flight_number, route) tuple, e.g. ("BA455", "AGP-LHR").
+        Returns a (flight_number, route) tuple where route is
+        [route_text, origin_coords, destination_coords]. Always this
+        3-element list shape, even on failure - callers rely on it.
         """
         try:
             r = requests.get(f"https://api.adsbdb.com/v0/callsign/{callsign}", timeout=self.timeout)
             if r.status_code == 200:
                 route_data = r.json().get("response", {}).get("flightroute", {}) or {}
                 flight_number = route_data.get("callsign_iata") or "?"
-                origin = (route_data.get("origin") or {}).get("iata_code") or "?"
-                destination = (route_data.get("destination") or {}).get("iata_code") or "?"
-                route = f"{origin}-{destination}" if not (origin == "?" and destination == "?") else "?"
+                route = self._format_route(route_data.get("origin") or {}, route_data.get("destination") or {})
                 return flight_number, route
         except requests.RequestException:
             pass
-        return "?", "?"
+        return "?", ["?", None, None]
+
+    @staticmethod
+    def _format_route(origin: dict, destination: dict) -> list:
+        def airport_label(airport: dict) -> Optional[str]:
+            name = airport.get("name")
+            code = airport.get("iata_code") or airport.get("icao_code")
+            if name and code:
+                return f"{name} ({code})"
+            return name or code
+
+        def airport_coords(airport: dict):
+            lat, lon = airport.get("latitude"), airport.get("longitude")
+            return (lat, lon) if lat is not None and lon is not None else None
+
+        origin_label = airport_label(origin)
+        destination_label = airport_label(destination)
+        if not origin_label and not destination_label:
+            text = "?"
+        else:
+            text = f"{origin_label or '?'} \u2192 {destination_label or '?'}"
+
+        return [text, airport_coords(origin), airport_coords(destination)]
 
 
 class FlightMap:
-    """Renders a list of Flights onto a Folium map and saves it as a self-refreshing HTML file."""
+    """Renders a list of Flights onto a Folium map and saves it as a self-refreshing HTML file.
 
-    def __init__(self, center_lat: float, center_lon: float, zoom_start: int = 8):
+    Aircraft with a known track are drawn as arrows pointing in their
+    direction of travel; aircraft with no known track (e.g. parked) fall
+    back to a plain colored dot. When both the origin and destination
+    airport coordinates are known, a line is drawn between them.
+    """
+
+    def __init__(self, center_lat: float, center_lon: float, zoom_start: int = 8, arrow_length: int = 22):
         self.center_lat = center_lat
         self.center_lon = center_lon
         self.zoom_start = zoom_start
+        self.arrow_length = arrow_length  # pixels; constant regardless of zoom level
 
     def render(self, flights: List[Flight], filename: str, refresh_seconds: int) -> str:
         m = folium.Map(
@@ -236,15 +305,8 @@ class FlightMap:
         for flight in flights:
             if not flight.has_position:
                 continue
-            folium.CircleMarker(
-                location=[flight.lat, flight.lon],
-                radius=6,
-                color=flight.marker_color,
-                fill=True,
-                fill_opacity=0.85,
-                popup=folium.Popup(flight.popup_html(), max_width=250),
-                tooltip=flight.label,
-            ).add_to(m)
+            self._add_marker(m, flight)
+            #self._add_route_line(m, flight)
 
         # OSM's tile policy requires a Referer header - this ensures the browser sends one
         m.get_root().html.add_child(
@@ -257,6 +319,45 @@ class FlightMap:
 
         m.save(filename)
         return os.path.abspath(filename)
+
+    def _add_marker(self, m: folium.Map, flight: Flight) -> None:
+        popup = folium.Popup(flight.popup_html(), max_width=250)
+
+        if flight.direction_radians is not None:
+            icon = ArrowIcon(
+                self.arrow_length,
+                flight.direction_radians,
+                color=flight.marker_color,
+                anchor="mid",  # center the arrow on the aircraft's actual position
+            )
+            folium.Marker(
+                location=[flight.lat, flight.lon],
+                icon=icon,
+                popup=popup,
+                tooltip=flight.label,
+            ).add_to(m)
+        else:
+            # No known heading - fall back to a plain dot rather than guessing a direction.
+            folium.CircleMarker(
+                location=[flight.lat, flight.lon],
+                radius=6,
+                color=flight.marker_color,
+                fill=True,
+                fill_opacity=0.85,
+                popup=popup,
+                tooltip=flight.label,
+            ).add_to(m)
+
+    def _add_route_line(self, m: folium.Map, flight: Flight) -> None:
+        """Draw a line between the origin and destination airports, if both are known."""
+        if not flight.has_route_coords:
+            return
+        folium.PolyLine(
+            locations=[flight.origin_coords,(flight.lat, flight.lon) ,flight.destination_coords],
+            color="#FF0000",
+            weight=2,
+            opacity=0.6,
+        ).add_to(m)
 
 
 class LocalMapServer:
@@ -331,7 +432,7 @@ class FlightTracker:
 
 
 def main():
-    LAT, LON, DIST_NM = lat,lon,dist
+    LAT, LON, DIST_NM = , 50
     tracker = FlightTracker(LAT, LON, DIST_NM, location_label="Czechia")
     tracker.start()
 
